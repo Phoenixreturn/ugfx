@@ -32,7 +32,7 @@ ifneq ($(GFXDRIVERS),)
 	include $(patsubst %,$(GFXLIB)/drivers/%/driver.mk,$(GFXDRIVERS))
 endif
 ifneq ($(GFXDEMO),)
-	include $(GFXLIB)/demos/$(GFXDEMO)/demo.mk
+	include $(GFXDEMO)/demo.mk
 endif
 
 # Include the operating system define

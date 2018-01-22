@@ -76,7 +76,7 @@ static const ltdcConfig driverCfg = {
 		0,									// Palette (RGB888, can be NULL)
 		0,									// Palette length
 		0xFF,								// Constant alpha factor
-		LTDC_LEF_ENABLE | LTDC_LEF_KEYING   // Layer configuration flags
+		LTDC_LEF_ENABLE						// Layer configuration flags
 	}
 #else
 	LTDC_UNUSED_LAYER_CONFIG

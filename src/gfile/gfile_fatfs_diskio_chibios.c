@@ -6,50 +6,58 @@
 /*-----------------------------------------------------------------------*/
 
 #include "../../gfx.h"
+#if HAL_USE_QSPI
+#include "qspiFlash.h"
+#endif
 
 #if GFX_USE_GFILE && GFILE_NEED_FATFS && GFX_USE_OS_CHIBIOS && !GFILE_FATFS_EXTERNAL_LIB
 
 #include "gfile_fatfs_wrapper.h"
 
 #if HAL_USE_MMC_SPI && HAL_USE_SDC
-	#error "cannot specify both MMC_SPI and SDC drivers"
+#error "cannot specify both MMC_SPI and SDC drivers"
 #endif
 
-#if HAL_USE_MMC_SPI
-	extern MMCDriver MMCD1;
+#if HAL_USE_QSPI
+extern QSPIDriver QSPID1;
+typedef struct {
+  /**
+    * буфер для одного сектора в 64 кБайта
+    */
+    uint8_t first[32768];
+    uint8_t second[32768];
+    uint8_t temp[256]; //без него нормально не считывает
+  /**
+   * номер сектора
+   */
+  int16_t numberSector;
+} SectorBuffer;
+
+SectorBuffer mainBuf;
+#elif HAL_USE_MMC_SPI
+extern MMCDriver MMCD1;
 #elif HAL_USE_SDC
-	extern SDCDriver SDCD1;
+extern SDCDriver SDCD1;
 #else
-	#error "MMC_SPI or SDC driver must be specified"
+#error "MMC_SPI or SDC driver must be specified"
+#endif
+
+#if HAL_USE_RTC
+#include "chrtclib.h"
+extern RTCDriver RTCD1;
 #endif
 
 /*-----------------------------------------------------------------------*/
 /* Correspondence between physical drive number and physical drive.      */
+
 #define MMC     0
 #define SDC     0
+#define QSPI    0
+
+
 /*-----------------------------------------------------------------------*/
-
-// WOW - Bugs galore!!! (in ChibiOS)
-//	Bugs:
-//		1. ChibiOS DMA operations do not do the appropriate cache flushing or invalidating
-//			on cpu's that require it eg STM32F7 series.
-//			Instead they provide explicit dmaBufferInvalidate and dmaBufferFlush calls
-//			and rely on the user to explicitly flush the cache.
-//			Solution: We explicitly flush the cache after any possible DMA operation.
-//		2. Unfortunately these explicit routines also have a bug. They assume that the
-//			specified data structure is aligned on a cache line boundary - not a good assumption.
-//			Solution: We increase the size provided to ChibiOS so that it does it properly.
-//						This assumes of course that we know the size of the cpu cache line.
-#if CH_KERNEL_MAJOR > 2
-	#define CPU_CACHE_LINE_SIZE			32
-	#define CACHE_FLUSH(buf, sz)		dmaBufferFlush((buf), (sz)+(CPU_CACHE_LINE_SIZE-1))
-	#define CACHE_INVALIDATE(buf, sz)	dmaBufferInvalidate((buf), (sz)+(CPU_CACHE_LINE_SIZE-1))
-#else
-	#define CACHE_FLUSH(buf, sz)
-	#define CACHE_INVALIDATE(buf, sz)
-#endif
-
 /* Initialize a Drive                                                    */
+
 DSTATUS disk_initialize (
     BYTE drv                /* Physical drive nmuber (0..) */
 )
@@ -65,6 +73,12 @@ DSTATUS disk_initialize (
       stat |= STA_NOINIT;
     if (mmcIsWriteProtected(&MMCD1))
       stat |=  STA_PROTECT;
+    return stat;
+#elif HAL_USE_QSPI
+  case QSPI:
+    mainBuf.numberSector = -1;
+    stat = 0;
+    startQSPIConfiguredForQuad();
     return stat;
 #else
   case SDC:
@@ -101,6 +115,14 @@ DSTATUS disk_status (
     if (mmcIsWriteProtected(&MMCD1))
       stat |= STA_PROTECT;
     return stat;
+#elif HAL_USE_QSPI
+  case QSPI:
+    stat = 0;
+      /* It is initialized externally, just reads the status.*/
+    if (getDriverState() != QSPI_READY) {
+      stat |= STA_NOINIT;
+    }
+    return stat;
 #else
   case SDC:
     stat = 0;
@@ -134,7 +156,6 @@ DRESULT disk_read (
       return RES_NOTRDY;
     if (mmcStartSequentialRead(&MMCD1, sector))
       return RES_ERROR;
-    CACHE_FLUSH(buff, MMCSD_BLOCK_SIZE*count);
     while (count > 0) {
       if (mmcSequentialRead(&MMCD1, buff))
         return RES_ERROR;
@@ -143,16 +164,17 @@ DRESULT disk_read (
     }
     if (mmcStopSequentialRead(&MMCD1))
         return RES_ERROR;
-    CACHE_INVALIDATE(buff, MMCSD_BLOCK_SIZE*count);
+    return RES_OK;
+#elif HAL_USE_QSPI
+  case QSPI:
+    quadIndirectReadMode(buff, count*512, sector*512);
     return RES_OK;
 #else
   case SDC:
     if (blkGetDriverState(&SDCD1) != BLK_READY)
       return RES_NOTRDY;
-    CACHE_FLUSH(buff, MMCSD_BLOCK_SIZE*count);
     if (sdcRead(&SDCD1, sector, buff, count))
       return RES_ERROR;
-    CACHE_INVALIDATE(buff, MMCSD_BLOCK_SIZE*count);
     return RES_OK;
 #endif
   }
@@ -172,6 +194,8 @@ DRESULT disk_write (
     UINT count            /* Number of sectors to write (1..255) */
 )
 {
+  uint32_t bSize = 0;
+  UINT tempCount = count;
   switch (drv) {
 #if HAL_USE_MMC_SPI
   case MMC:
@@ -181,7 +205,6 @@ DRESULT disk_write (
         return RES_WRPRT;
     if (mmcStartSequentialWrite(&MMCD1, sector))
         return RES_ERROR;
-    CACHE_FLUSH(buff, MMCSD_BLOCK_SIZE*count);
     while (count > 0) {
         if (mmcSequentialWrite(&MMCD1, buff))
             return RES_ERROR;
@@ -191,11 +214,33 @@ DRESULT disk_write (
     if (mmcStopSequentialWrite(&MMCD1))
         return RES_ERROR;
     return RES_OK;
+#elif HAL_USE_QSPI
+  case QSPI:
+//    __disable_irq();
+    while(count > 0) {
+      if(mainBuf.numberSector == sector*512 >> 16) {
+          setBufferWithSector(sector, bSize, buff);
+      } else if (mainBuf.numberSector == -1) {
+          readExternalFlash(sector);
+          setBufferWithSector(sector, bSize, buff);
+      } else {
+          writeBufferToFlash();
+          readExternalFlash(sector);
+          setBufferWithSector(sector, bSize, buff);
+      }
+      count--;
+      sector++;
+      bSize++;
+    }
+
+    writeBufferToFlash();
+    mainBuf.numberSector = -1;
+//    __enable_irq();
+    return RES_OK;
 #else
   case SDC:
     if (blkGetDriverState(&SDCD1) != BLK_READY)
       return RES_NOTRDY;
-    CACHE_FLUSH(buff, MMCSD_BLOCK_SIZE*count);
     if (sdcWrite(&SDCD1, sector, buff, count))
       return RES_ERROR;
     return RES_OK;
@@ -233,6 +278,18 @@ DRESULT disk_ioctl (
     default:
         return RES_PARERR;
     }
+#elif HAL_USE_QSPI
+    case QSPI:
+      switch (ctrl) {
+        case CTRL_SYNC:
+          return RES_OK;
+        case GET_SECTOR_COUNT:
+          *((DWORD *)buff) = 32768;
+          return RES_OK;
+        case GET_BLOCK_SIZE:
+          *((DWORD *)buff) = 128; /* 512b blocks in one erase block */
+          return RES_OK;
+      }
 #else
   case SDC:
     switch (ctrl) {
@@ -260,19 +317,52 @@ DRESULT disk_ioctl (
   return RES_PARERR;
 }
 
+DWORD get_fattime(void) {
 #if HAL_USE_RTC
-	extern RTCDriver RTCD1;
-
-	DWORD get_fattime(void) {
-	    RTCDateTime timespec;
-
-	    rtcGetTime(&RTCD1, &timespec);
-	    return rtcConvertDateTimeToFAT(&timespec);
-	}
+    return rtcGetTimeFat(&RTCD1);
 #else
-	DWORD get_fattime(void) {
-	    return ((uint32_t)0 | (1 << 16)) | (1 << 21); /* wrong but valid time */
-	}
+    return ((uint32_t)0 | (1 << 16)) | (1 << 21); /* wrong but valid time */
 #endif
+}
+
+void writeBufferToFlash() {
+    volatile uint16_t i = 0;
+    while(readStatusRegisterProgressBitQuadMode()) {}
+    sectorErase(mainBuf.numberSector << 16);
+    while(readStatusRegisterProgressBitQuadMode()) {}
+
+    for(i; i < 256; i++) {
+      if(i*256 > 32767) {
+        quadIndirectWriteMode(mainBuf.second + i*256 - 32768, 256,
+                              (mainBuf.numberSector << 16) + i*256);
+        while(readStatusRegisterProgressBitQuadMode()) {}
+
+      } else {
+        quadIndirectWriteMode(mainBuf.first + i*256, 256,
+                              (mainBuf.numberSector << 16) + i*256);
+        while(readStatusRegisterProgressBitQuadMode()) {}
+
+      }
+    }
+}
+
+void setBufferWithSector(DWORD sector, uint32_t bSize, const BYTE *buff) {
+  uint32_t baseAddr = (sector*512) & 0xFFFF;
+  for(uint16_t i = 0; i < 512; i++) {
+    if(i > 32767) {
+      mainBuf.second[baseAddr + i] = buff[bSize*512 + i];
+    } else {
+      mainBuf.first[baseAddr + i] = buff[bSize*512 + i];
+    }
+  }
+}
+
+void readExternalFlash(DWORD sector) {
+    mainBuf.numberSector = sector*512 >> 16;
+    quadIndirectReadMode(mainBuf.first, 32768, mainBuf.numberSector << 16);
+    quadIndirectReadMode(mainBuf.second, 32768, (mainBuf.numberSector << 16) + 32768);
+}
 
 #endif // GFX_USE_GFILE && GFILE_NEED_FATFS && GFX_USE_OS_CHIBIOS && !GFILE_FATFS_EXTERNAL_LIB
+
+
